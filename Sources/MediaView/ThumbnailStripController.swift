@@ -13,6 +13,7 @@ final class ThumbnailStripController: NSViewController, NSCollectionViewDataSour
     var onNavigate: ((Int) -> Void)?
     var onFocusCanvas: (() -> Void)?
     var onContextMenu: (() -> NSMenu?)?
+    var selectionStatus: ((URL) -> PhotoSelectionStatus?)? { didSet { refreshSelectionStatuses() } }
     let collectionView = ThumbnailCollectionView()
     let scrollView = HorizontalThumbnailScrollView()
     private(set) var images: [URL] = []
@@ -30,6 +31,13 @@ final class ThumbnailStripController: NSViewController, NSCollectionViewDataSour
     private var pixelDimension = 0
     private var previousScrollX: CGFloat = 0
     var pendingRequestCount: Int { tasks.count }
+
+    func refreshSelectionStatuses() {
+        guard isViewLoaded else { return }
+        for case let item as ThumbnailItem in collectionView.visibleItems() {
+            item.setSelectionStatus(item.representedURL.flatMap { selectionStatus?($0) })
+        }
+    }
 
     init(decoder: ImageDecoder) {
         self.decoder = decoder
@@ -328,6 +336,7 @@ final class ThumbnailStripController: NSViewController, NSCollectionViewDataSour
         let item = collectionView.makeItem(withIdentifier: ThumbnailItem.identifier, for: indexPath) as! ThumbnailItem
         let url = images[indexPath.item]
         item.configure(url: url, result: loaded[url], relativeDirectory: relativeDirectory(for: url))
+        item.setSelectionStatus(selectionStatus?(url))
         return item
     }
 
@@ -342,6 +351,7 @@ final class ThumbnailStripController: NSViewController, NSCollectionViewDataSour
         guard images.indices.contains(indexPath.item), let item = item as? ThumbnailItem else { return }
         let url = images[indexPath.item]
         item.configure(url: url, result: loaded[url], relativeDirectory: relativeDirectory(for: url))
+        item.setSelectionStatus(selectionStatus?(url))
     }
 
     func collectionView(_ collectionView: NSCollectionView, didEndDisplaying item: NSCollectionViewItem,
@@ -354,6 +364,7 @@ final class ThumbnailStripController: NSViewController, NSCollectionViewDataSour
 
 @MainActor
 final class ThumbnailCollectionView: NSCollectionView {
+    var onSelectionKey: ((NSEvent) -> Bool)?
     var onNavigate: ((Int) -> Void)?
     var onFinishInteraction: (() -> Void)?
     var onContextMenu: ((IndexPath?) -> NSMenu?)?
@@ -380,6 +391,7 @@ final class ThumbnailCollectionView: NSCollectionView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if onSelectionKey?(event) == true { return }
         switch event.keyCode {
         case 123: onNavigate?(-1)
         case 124: onNavigate?(1)
@@ -443,6 +455,7 @@ final class ThumbnailItem: NSCollectionViewItem {
     static let identifier = NSUserInterfaceItemIdentifier("ThumbnailItem")
     let directoryBadge: NSImageView = ThumbnailBadgeView(symbol: "folder")
     let videoBadge: NSImageView = ThumbnailBadgeView(symbol: "play.fill")
+    let selectionBadge = NSTextField(labelWithString: "")
     private(set) var representedURL: URL?
 
     override var isSelected: Bool { didSet { updateSelection() } }
@@ -469,6 +482,13 @@ final class ThumbnailItem: NSCollectionViewItem {
         view.addSubview(directoryBadge)
         videoBadge.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(videoBadge)
+        selectionBadge.translatesAutoresizingMaskIntoConstraints = false
+        selectionBadge.font = .systemFont(ofSize: 10, weight: .semibold)
+        selectionBadge.drawsBackground = true
+        selectionBadge.backgroundColor = NSColor.black.withAlphaComponent(0.8)
+        selectionBadge.alignment = .center
+        selectionBadge.isHidden = true
+        view.addSubview(selectionBadge)
         imageView = image
         textField = label
         NSLayoutConstraint.activate([
@@ -487,6 +507,10 @@ final class ThumbnailItem: NSCollectionViewItem {
             videoBadge.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
             videoBadge.widthAnchor.constraint(equalToConstant: 18),
             videoBadge.heightAnchor.constraint(equalToConstant: 18),
+            selectionBadge.topAnchor.constraint(equalTo: view.topAnchor, constant: 8),
+            selectionBadge.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
+            selectionBadge.widthAnchor.constraint(equalToConstant: 50),
+            selectionBadge.heightAnchor.constraint(equalToConstant: 17),
         ])
         updateSelection()
     }
@@ -494,10 +518,19 @@ final class ThumbnailItem: NSCollectionViewItem {
     func configure(url: URL, result: Result<DecodedImage, Error>?, relativeDirectory: String?) {
         _ = view
         representedURL = url
+        setSelectionStatus(nil)
         videoBadge.isHidden = MediaFileTypes.kind(for: url) != .video
         textField?.stringValue = url.lastPathComponent
         updateSource(relativeDirectory: relativeDirectory)
         if let result { show(result) } else { clearImage() }
+    }
+
+    func setSelectionStatus(_ status: PhotoSelectionStatus?) {
+        selectionBadge.isHidden = status == nil
+        let prefix = status == .picked ? "✓" : (status == .skipped ? "−" : "○")
+        selectionBadge.stringValue = status.map { "\(prefix) \($0.title)" } ?? ""
+        selectionBadge.textColor = status == .picked ? .systemGreen : .secondaryLabelColor
+        view.setAccessibilityValue(status.map { "选片状态：\($0.title)" })
     }
 
     /// 来源属于文件而非解码结果；根目录切换可单独更新，加载、失败和缓存失效都不会抹掉角标。
@@ -536,6 +569,7 @@ final class ThumbnailItem: NSCollectionViewItem {
         textField?.stringValue = ""
         directoryBadge.isHidden = true
         videoBadge.isHidden = true
+        setSelectionStatus(nil)
         view.toolTip = nil
         view.setAccessibilityLabel(nil)
         view.setAccessibilityHelp(nil)

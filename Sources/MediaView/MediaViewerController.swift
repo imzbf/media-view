@@ -1,5 +1,19 @@
 import AppKit
 
+/// 查重期间只向辅助功能暴露前景工作区，退出后恢复 AppKit 对原控件的动态发现。
+@MainActor
+private final class MediaViewerRootView: NSView {
+    weak var accessibilityOverlay: NSView? {
+        didSet { NSAccessibility.post(element: self, notification: .layoutChanged) }
+    }
+
+    override func accessibilityChildren() -> [Any]? {
+        // setAccessibilityChildren(nil) 会留下空的显式覆盖，无法重新发现浏览和选片控件。
+        if let accessibilityOverlay { return [accessibilityOverlay] }
+        return super.accessibilityChildren()
+    }
+}
+
 @MainActor
 final class MediaViewerController: NSViewController, NSMenuItemValidation {
     let canvas = ImageCanvasView(frame: NSRect(x: 0, y: 0, width: 1100, height: 760))
@@ -8,6 +22,28 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
     let nextButton = ViewerIconButton(symbol: "chevron.right", label: "下一项", style: .navigation)
     let playback: GIFPlaybackController
     let videoPlayback: VideoPlaybackController
+    let selectionHeader = SelectionHeaderView(frame: .zero)
+    let selectionActions = SelectionActionBar(frame: .zero)
+    let selectionEmpty = SelectionEmptyView(frame: .zero)
+    let selectionGrid: SelectionGridController
+    private(set) var duplicateReview: DuplicateReviewController?
+    private(set) var isDuplicateStarting = false
+    private let duplicateStore: DuplicateStore
+    private var duplicateTask: Task<Void, Never>?
+    private var duplicateRemovedFiles: Set<URL> = []
+    private(set) var selection: SelectionSession?
+    private(set) var isSelectionStarting = false
+    private(set) var isSelectionTransition = false
+    private(set) var isExportingSelection = false
+    private let selectionStore: SelectionStore
+    private var libraryImages: [URL] = []
+    private var selectionPreviousScope: Bool?
+    private var selectionTask: Task<Void, Never>?
+    private var exportTask: Task<Void, Never>?
+    private var exportPanel: SelectionExportPanel?
+    private(set) var lastSelectionExport: SelectionExportResult?
+    private var headerHeight: NSLayoutConstraint?
+    private var actionsHeight: NSLayoutConstraint?
     var onOpenPanel: (() -> Void)?
     var onCommandStateChanged: (() -> Void)?
     private(set) var images: [URL] = []
@@ -56,13 +92,18 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
 
     init(decoder: ImageDecoder = ImageDecoder(),
          videoPlayback: VideoPlaybackController? = nil,
+         selectionStore: SelectionStore = SelectionStore(),
+         duplicateStore: DuplicateStore = DuplicateStore(),
          trashItem: @escaping @Sendable (URL) throws -> Void = {
              try FileManager.default.trashItem(at: $0, resultingItemURL: nil)
          })
     {
         self.decoder = decoder
+        self.selectionStore = selectionStore
+        self.duplicateStore = duplicateStore
         self.trashItem = trashItem
         thumbnailStrip = ThumbnailStripController(decoder: decoder)
+        selectionGrid = SelectionGridController(decoder: decoder)
         playback = GIFPlaybackController(decoder: decoder)
         self.videoPlayback = videoPlayback ?? VideoPlaybackController()
         super.init(nibName: nil, bundle: nil)
@@ -74,38 +115,77 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
     var hasImage: Bool { displayedImage != nil }
     var hasVideo: Bool { videoPlayback.state == .ready && videoPlayback.url == currentURL }
     var hasContent: Bool { hasImage || hasVideo }
-    var canGoBack: Bool { !isOpening && (currentIndex ?? 0) > 0 }
-    var canGoForward: Bool { !isOpening && (currentIndex.map { $0 + 1 < images.count } ?? false) }
-    var isThumbnailStripVisible: Bool { showsThumbnails && !images.isEmpty }
-    var canReloadImage: Bool { currentURL != nil && !isOpening && !isTrashing }
-    var canCopyImage: Bool { currentURL != nil && !isOpening && !isTrashing }
+    var canGoBack: Bool { duplicateReview == nil && !isDuplicateStarting && !isOpening && !isSelectionTransition && selection?.showsGrid != true && (currentIndex ?? 0) > 0 }
+    var canGoForward: Bool { duplicateReview == nil && !isDuplicateStarting && !isOpening && !isSelectionTransition && selection?.showsGrid != true && (currentIndex.map { $0 + 1 < images.count } ?? false) }
+    var isThumbnailStripVisible: Bool {
+        duplicateReview == nil && !isDuplicateStarting && showsThumbnails && !images.isEmpty && selection?.showsGrid != true
+            && (selection == nil || (isViewLoaded && view.bounds.height >= 500))
+    }
+    var canReloadImage: Bool { duplicateReview == nil && !isDuplicateStarting && currentURL != nil && !isOpening && !isTrashing && !isSelectionTransition && selection?.showsGrid != true }
+    // 网格的键盘焦点由 CollectionView 管理，文件操作只在明确打开大图后针对当前 URL 生效。
+    var canCopyImage: Bool { canReloadImage }
     // 扫描和排序会提交整份快照，完成后再允许删除，避免旧列表重新带回已移走的文件。
     var canTrashImage: Bool { canCopyImage && !isScanning && !isSorting }
-    var canRefreshDirectory: Bool { directory != nil && !isOpening && !isTrashing }
-    var canChangeLibraryOptions: Bool { !isOpening && !isTrashing }
+    var canRefreshDirectory: Bool { directory != nil && canChangeLibraryOptions }
+    var canChangeLibraryOptions: Bool { duplicateReview == nil && !isDuplicateStarting && !isOpening && !isTrashing && !isSelectionStarting && !isSelectionTransition }
+    var canCheckDuplicates: Bool { directory != nil && canChangeLibraryOptions && !isScanning && !isSorting && !isExportingSelection }
+    var canStartSelection: Bool { directory != nil && !isScanning && !isSorting && canChangeLibraryOptions && selection == nil }
+    var canMarkSelection: Bool {
+        selection != nil && selection?.showsGrid == false && currentURL != nil && !isLoading
+            && !isScanning && !isSorting && canChangeLibraryOptions && view.window?.attachedSheet == nil
+    }
+    var canExportSelection: Bool {
+        selection?.pickedURLs.isEmpty == false && !isScanning && canChangeLibraryOptions && !isExportingSelection
+    }
+    var needsLibraryDeparture: Bool { selection != nil || isSelectionStarting || isExportingSelection || duplicateReview != nil || isDuplicateStarting }
+    override var undoManager: UndoManager? { duplicateReview == nil ? (selection?.undoManager ?? super.undoManager) : nil }
     var isEditingText: Bool {
         guard isViewLoaded, let responder = view.window?.firstResponder else { return false }
         return responder is NSTextView || responder is NSTextField
     }
 
     override func loadView() {
-        view = NSView(frame: canvas.frame)
+        view = MediaViewerRootView(frame: canvas.frame)
         addChild(thumbnailStrip)
+        addChild(selectionGrid)
         canvas.translatesAutoresizingMaskIntoConstraints = false
         thumbnailStrip.view.translatesAutoresizingMaskIntoConstraints = false
+        for child in [selectionHeader, selectionActions, selectionGrid.view, selectionEmpty] {
+            child.translatesAutoresizingMaskIntoConstraints = false
+            child.isHidden = true
+            view.addSubview(child)
+        }
         view.addSubview(canvas)
         view.addSubview(thumbnailStrip.view)
+        // 网格和空态占用大图区域，操作条拥有独立空间，始终不会盖住照片。
+        view.addSubview(selectionGrid.view, positioned: .above, relativeTo: canvas)
+        view.addSubview(selectionEmpty, positioned: .above, relativeTo: selectionGrid.view)
         stripHeight = thumbnailStrip.view.heightAnchor.constraint(equalToConstant: 0)
+        headerHeight = selectionHeader.heightAnchor.constraint(equalToConstant: 0)
+        actionsHeight = selectionActions.heightAnchor.constraint(equalToConstant: 0)
         NSLayoutConstraint.activate([
             canvas.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             canvas.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            canvas.topAnchor.constraint(equalTo: view.topAnchor),
-            canvas.bottomAnchor.constraint(equalTo: thumbnailStrip.view.topAnchor),
+            canvas.topAnchor.constraint(equalTo: selectionHeader.bottomAnchor),
+            canvas.bottomAnchor.constraint(equalTo: selectionActions.topAnchor),
+            selectionHeader.topAnchor.constraint(equalTo: view.topAnchor),
+            selectionHeader.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            selectionHeader.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            selectionActions.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            selectionActions.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            selectionActions.bottomAnchor.constraint(equalTo: thumbnailStrip.view.topAnchor),
             thumbnailStrip.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             thumbnailStrip.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             thumbnailStrip.view.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            stripHeight!,
+            stripHeight!, headerHeight!, actionsHeight!,
         ])
+        for child in [selectionGrid.view, selectionEmpty] {
+            NSLayoutConstraint.activate([
+                child.leadingAnchor.constraint(equalTo: canvas.leadingAnchor), child.trailingAnchor.constraint(equalTo: canvas.trailingAnchor),
+                child.topAnchor.constraint(equalTo: canvas.topAnchor), child.bottomAnchor.constraint(equalTo: canvas.bottomAnchor),
+            ])
+        }
+        connectSelectionControls()
         thumbnailStrip.view.isHidden = true
         thumbnailStrip.onSelect = { [weak self] in self?.selectImage($0) }
         thumbnailStrip.onNavigate = { [weak self] in self?.navigate(by: $0) }
@@ -165,7 +245,26 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
         updateWindowVisibility()
     }
 
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        if selection != nil {
+            let height = selectionHeader.preferredHeight
+            if headerHeight?.constant != height { headerHeight?.constant = height }
+            updateThumbnailVisibility()
+        }
+    }
+
     func open(_ inputs: [URL]) {
+        guard !isSelectionTransition else { return }
+        if needsLibraryDeparture {
+            Task { [weak self] in
+                guard let self, await self.prepareForLibraryDeparture() else { return }
+                self.beginOpening(inputs)
+            }
+        } else { beginOpening(inputs) }
+    }
+
+    private func beginOpening(_ inputs: [URL]) {
         _ = view
         cancelTasks()
         // 验证输入期间暂停旧 GIF 和视频；若拖入无效文件，仍能从原位置继续播放。
@@ -173,13 +272,17 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
         playback.setVisible(false)
         videoPlayback.setVisible(false)
         thumbnailStrip.setLoadingEnabled(false)
+        // 重置解码器前同步清掉网格的在途请求；无效输入恢复原会话时才能重新请求缩略图。
+        selectionGrid.setActive(false)
         session = UUID()
         loadID = UUID()
         isLoading = false
         let openingSession = session
         scanID = UUID()
         let openingScan = scanID
-        let options = libraryOptions
+        var options = libraryOptions
+        options.includesSubdirectories = selectionPreviousScope ?? options.includesSubdirectories
+        let openingOptions = options
         isScanning = true
         if images.isEmpty {
             canvas.showStatus(title: "正在扫描…", detail: "", symbol: "folder")
@@ -192,10 +295,13 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
             await self.decoder.reset()
             do {
                 var receivedSelection = false
-                for try await snapshot in ImageLibrary.scan(opening: inputs, options: options) {
+                for try await snapshot in ImageLibrary.scan(opening: inputs, options: openingOptions) {
                     try Task.checkCancellation()
                     guard self.session == openingSession, self.scanID == openingScan else { return }
                     if !receivedSelection {
+                        self.clearDuplicateReview()
+                        self.clearSelectionMode()
+                        self.libraryOptions.includesSubdirectories = openingOptions.includesSubdirectories
                         // 验证成功后才替换图库；误拖入不支持的文件仍可继续浏览原目录。
                         self.images = []
                         self.currentIndex = nil
@@ -204,12 +310,12 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
                         self.playback.stop()
                         self.videoPlayback.stop()
                         self.isOpening = false
-                        self.appliedScope = options.includesSubdirectories
+                        self.appliedScope = openingOptions.includesSubdirectories
                         self.hideSearch()
                         self.canvas.showStatus(title: "正在扫描…", detail: "", symbol: "folder")
                         receivedSelection = true
                     }
-                    self.apply(snapshot, sortedBy: options.sort)
+                    self.apply(snapshot, sortedBy: openingOptions.sort)
                 }
             } catch is CancellationError {
                 return
@@ -248,10 +354,16 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
         isSorting = false
         libraryRevision = UUID()
         let previousURL = currentURL
-        images = snapshot.images
-        currentIndex = snapshot.currentIndex(keeping: previousURL)
+        libraryImages = snapshot.images
         directory = snapshot.directory
         isScanning = !snapshot.isComplete
+        if let selection {
+            selection.updatePhotos(snapshot.images, complete: snapshot.isComplete)
+            if snapshot.isComplete, let order, order != libraryOptions.sort { scheduleSort() }
+            return
+        }
+        images = snapshot.images
+        currentIndex = snapshot.currentIndex(keeping: previousURL)
         thumbnailStrip.update(images: images, selectedURL: currentURL, rootDirectory: directory)
         updateThumbnailVisibility()
         if let currentURL, currentURL != previousURL {
@@ -283,7 +395,7 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
     }
 
     func navigate(by delta: Int) {
-        guard let index = currentIndex else { return }
+        guard duplicateReview == nil, !isDuplicateStarting, let index = currentIndex else { return }
         let next = index + delta
         guard images.indices.contains(next), next != index else { return }
         selectImage(images[next])
@@ -294,7 +406,12 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
     @objc private func nextImage() { canvas.cancelInteraction(); navigate(by: 1) }
 
     func selectImage(_ url: URL, focusCanvas: Bool = true) {
-        guard !isOpening, let index = images.firstIndex(of: url) else { return }
+        guard duplicateReview == nil, !isDuplicateStarting, !isOpening, !isSelectionTransition, let index = images.firstIndex(of: url) else { return }
+        if let selection {
+            if selection.currentURL != url || selection.showsGrid { selection.openPhoto(url) }
+            if focusCanvas { view.window?.makeFirstResponder(canvas) }
+            return
+        }
         thumbnailStrip.select(url, reveal: true)
         if focusCanvas { view.window?.makeFirstResponder(canvas) }
         guard index != currentIndex else { return }
@@ -315,11 +432,11 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
     private func scheduleSort() {
         sortTask?.cancel()
         sortID = UUID()
-        guard !images.isEmpty else { isSorting = false; return }
+        guard !libraryImages.isEmpty else { isSorting = false; return }
         isSorting = true
         let id = sortID
         let revision = libraryRevision
-        let images = images
+        let images = libraryImages
         let order = libraryOptions.sort
         updateTitle()
         sortTask = Task { [weak self] in
@@ -331,6 +448,13 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
                 try Task.checkCancellation()
                 guard let self, self.sortID == id, self.libraryRevision == revision else { return }
                 let selected = self.currentURL
+                self.libraryImages = result
+                if let selection = self.selection {
+                    self.libraryRevision = UUID()
+                    self.isSorting = false
+                    selection.updatePhotos(result, complete: !self.isScanning)
+                    return
+                }
                 self.images = result
                 self.currentIndex = selected.flatMap { result.firstIndex(of: $0) }
                 self.libraryRevision = UUID()
@@ -349,7 +473,7 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
     }
 
     func setIncludesSubdirectories(_ includes: Bool) {
-        guard canChangeLibraryOptions, libraryOptions.includesSubdirectories != includes else { return }
+        guard selection == nil, canChangeLibraryOptions, libraryOptions.includesSubdirectories != includes else { return }
         libraryOptions.includesSubdirectories = includes
         if directory != nil { rescanDirectory(resetCache: false) }
     }
@@ -410,6 +534,7 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
                     self.loadID = UUID()
                     self.isLoading = false
                     self.thumbnailStrip.setLoadingEnabled(false)
+                    self.selectionGrid.setActive(false)
                     self.updateTitle()
                     await self.decoder.reset()
                     try Task.checkCancellation()
@@ -420,7 +545,7 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
                 self.isRefreshing = false
                 self.apply(LibrarySnapshot(directory: directory, images: ordered, preferredImage: nil,
                                            isComplete: true, skippedPaths: final.skippedPaths), sortedBy: order)
-                if resetCache, self.currentURL == selected, selected != nil {
+                if resetCache, self.currentURL == selected, selected != nil, self.selection?.showsGrid != true {
                     self.loadCurrent(quality: quality, preservingImage: self.hasImage)
                     self.refreshInfo()
                 }
@@ -447,8 +572,13 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
     @objc func copy(_ sender: Any?) { copyCurrentImage() }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        guard menuItem.action == #selector(copy(_:)) else { return true }
-        return canCopyImage && view.window?.attachedSheet == nil
+        guard duplicateReview == nil, !isDuplicateStarting, view.window?.attachedSheet == nil else { return false }
+        switch menuItem.action {
+        case #selector(copy(_:)): return canCopyImage
+        case #selector(undo(_:)): return !isSelectionTransition && selection?.undoManager.canUndo == true
+        case #selector(redo(_:)): return !isSelectionTransition && selection?.undoManager.canRedo == true
+        default: return true
+        }
     }
 
     /// 写入原文件 URL，Finder 粘贴时保留图片、视频及其元数据，不复制预览内容。
@@ -481,11 +611,11 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
                 try Task.checkCancellation()
                 guard let self, self.session == session else { return }
                 if let index = self.images.firstIndex(of: url) {
-                    var remaining = self.images
-                    remaining.remove(at: index)
+                    let remaining = self.libraryImages.filter { $0 != url }
+                    let visibleRemaining = self.images.filter { $0 != url }
                     // 按删除时的列表位置选择下一张，末尾则选上一张；期间主动切图就保留新选择。
-                    if self.currentURL == url, !remaining.isEmpty {
-                        self.selectImage(remaining[min(index, remaining.count - 1)], focusCanvas: false)
+                    if self.currentURL == url, !visibleRemaining.isEmpty {
+                        self.selectImage(visibleRemaining[min(index, visibleRemaining.count - 1)], focusCanvas: false)
                     }
                     self.apply(LibrarySnapshot(directory: directory, images: remaining, preferredImage: nil,
                                                isComplete: true, skippedPaths: 0))
@@ -517,7 +647,7 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
     }
 
     private func loadCurrent(quality: DecodeQuality, preservingImage: Bool, invalidateCache: Bool = false) {
-        guard let url = currentURL else { return }
+        guard duplicateReview == nil, let url = currentURL, selection?.showsGrid != true else { return }
         decodeTask?.cancel()
         cancelLoadingIndicator()
         resizeTask?.cancel()
@@ -529,6 +659,7 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
         let isVideo = MediaFileTypes.kind(for: url) == .video
         requestedQuality = isVideo ? nil : quality
         isLoading = true
+        updateSelectionControls()
         // 旧图仅由画布暂留，不能被当作当前 URL 已解码，否则新图会继承旧图视角或错误回退。
         if !preservingImage || isVideo { displayedImage = nil }
         if isVideo {
@@ -575,6 +706,7 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
                                         visible: self.isWindowVisible && !self.isOpening)
                 }
                 self.prefetchNeighbors()
+                self.updateTitle()
             } catch is CancellationError {
                 return
             } catch {
@@ -624,7 +756,7 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
     }
 
     private func prefetchNeighbors() {
-        guard let index = currentIndex else { return }
+        guard duplicateReview == nil, selection?.showsGrid != true, let index = currentIndex else { return }
         let urls = [index + 1, index - 1].filter { images.indices.contains($0) }.map { images[$0] }
         let quality = canvas.screenQuality
         let requestID = loadID
@@ -637,7 +769,7 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
 
     func showSearch() {
         _ = view
-        guard !images.isEmpty else { return }
+        guard duplicateReview == nil, !images.isEmpty else { return }
         if searchBar.superview == nil {
             searchBar.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview(searchBar)
@@ -699,7 +831,6 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
         isSearching = true
         searchBar.setStatus("查找中…")
         let id = searchID
-        let revision = libraryRevision
         let images = images
         searchTask = Task { [weak self] in
             do {
@@ -709,7 +840,8 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
                 }
                 let matches = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
                 try Task.checkCancellation()
-                guard let self, self.searchID == id, self.libraryRevision == revision, self.isSearchVisible else { return }
+                // searchID 随查询和可见列表失效；完整图库刷新未必改变筛选结果，不能据此丢弃查询。
+                guard let self, self.searchID == id, self.isSearchVisible else { return }
                 self.searchMatches = matches
                 self.isSearching = false
                 self.updateSearchStatus()
@@ -751,6 +883,7 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
 
     func toggleInfo() {
         _ = view
+        guard duplicateReview == nil else { return }
         showsInfo.toggle()
         if !showsInfo {
             infoTask?.cancel()
@@ -839,15 +972,18 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
 
     func setWindowVisible(_ visible: Bool) {
         isWindowVisible = visible
-        playback.setVisible(visible && !isOpening)
-        videoPlayback.setVisible(visible && !isOpening)
+        let browsing = visible && duplicateReview == nil && !isDuplicateStarting
+        playback.setVisible(browsing && !isOpening && selection?.showsGrid != true)
+        videoPlayback.setVisible(browsing && !isOpening && selection?.showsGrid != true)
+        selectionGrid.setActive(browsing && !isOpening && selection?.showsGrid == true)
+        duplicateReview?.setVisible(visible)
         updateThumbnailVisibility()
     }
 
     private func updateNavigationButtons() {
         // 导航取决于图库位置而非解码结果，加载中和损坏媒体仍可跳过，空图库则不显示控件。
-        previousButton.isHidden = currentURL == nil
-        nextButton.isHidden = currentURL == nil
+        previousButton.isHidden = currentURL == nil || selection?.showsGrid == true
+        nextButton.isHidden = currentURL == nil || selection?.showsGrid == true
         previousButton.isEnabled = canGoBack
         nextButton.isEnabled = canGoForward
         previousButton.setAccessibilityHelp(canGoBack ? "显示上一项" : "已是第一项或暂不可切换")
@@ -856,8 +992,15 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
 
     private func updateTitle() {
         updateNavigationButtons()
+        updateSelectionControls()
         onCommandStateChanged?()
         guard isViewLoaded, let window = view.window else { return }
+        if duplicateReview != nil {
+            window.title = "\(directory?.lastPathComponent ?? "") — 重复检查"
+            window.subtitle = "照片与视频 · 包含子文件夹"
+            window.representedURL = directory
+            return
+        }
         if let url = currentURL, let index = currentIndex {
             let activity = isTrashing ? " · 正在删除" : (isScanning ? " · 扫描中" : (isSorting ? " · 排序中" : ""))
             window.title = "\(url.lastPathComponent) — \(index + 1) / \(images.count)\(activity)"
@@ -878,6 +1021,17 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
     }
 
     func closeLibrary() {
+        duplicateTask?.cancel()
+        isDuplicateStarting = false
+        clearDuplicateReview()
+        selectionTask?.cancel()
+        isSelectionStarting = false
+        if let scope = selectionPreviousScope {
+            libraryOptions.includesSubdirectories = scope
+            appliedScope = scope
+        }
+        clearSelectionMode()
+        libraryImages = []
         cancelTasks()
         hideSearch()
         if showsInfo { toggleInfo() }
@@ -922,5 +1076,326 @@ final class MediaViewerController: NSViewController, NSMenuItemValidation {
         isSearching = false
         isRefreshing = false
         isTrashing = false
+    }
+}
+
+// 选片投影共用现有的解码、缩放和搜索；完整目录快照始终留在 libraryImages 中。
+extension MediaViewerController {
+    /// 查重覆盖原工作区，但保留选片会话和浏览位置；只有明确清理才在退出时刷新原图库。
+    func startDuplicateCheck() {
+        guard canCheckDuplicates, let directory else { return }
+        isDuplicateStarting = true
+        let openingSession = session
+        updateTitle()
+        duplicateTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.isDuplicateStarting = false; self.duplicateTask = nil; self.updateTitle() }
+            do {
+                try await self.selection?.flush()
+                let record: SelectionRecord?
+                if let selection = self.selection { record = selection.record }
+                else { record = try await self.selectionStore.load(root: directory) }
+                try Task.checkCancellation()
+                guard self.session == openingSession, self.directory == directory else { return }
+                let picked = Set(record?.marks.filter { $0.value == .picked }.keys.map { $0 } ?? [])
+                let duplicates = DuplicateSession(root: directory, store: self.duplicateStore, trash: self.trashItem)
+                let review = DuplicateReviewController(session: duplicates, pickedPaths: picked)
+                self.hideSearch()
+                if self.showsInfo { self.toggleInfo() }
+                self.decodeTask?.cancel()
+                self.cancelLoadingIndicator()
+                self.resizeTask?.cancel()
+                self.loadID = UUID()
+                self.isLoading = false
+                self.canvas.cancelInteraction()
+                self.duplicateReview = review
+                self.duplicateRemovedFiles = []
+                self.addChild(review)
+                review.view.frame = self.view.bounds
+                review.view.autoresizingMask = [.width, .height]
+                self.view.addSubview(review.view, positioned: .above, relativeTo: nil)
+                (self.view as? MediaViewerRootView)?.accessibilityOverlay = review.view
+                review.onExit = { [weak self] in self?.endDuplicateCheck() }
+                duplicates.onFilesRemoved = { [weak self] in self?.duplicateRemovedFiles.formUnion($0) }
+                self.setWindowVisible(self.isWindowVisible)
+                self.view.window?.makeFirstResponder(review.groupTable)
+                duplicates.startScan()
+            } catch is CancellationError { return }
+            catch { self.canvas.showNotice("无法进入重复检查：\(error.localizedDescription)") }
+        }
+    }
+
+    func endDuplicateCheck() {
+        guard let review = duplicateReview, !isSelectionTransition else { return }
+        isSelectionTransition = true
+        updateTitle()
+        Task { [weak self] in
+            let ready = await review.session.prepareForDeparture()
+            guard let self else { return }
+            self.isSelectionTransition = false
+            guard ready, self.duplicateReview === review else { self.updateTitle(); return }
+            let changed = !self.duplicateRemovedFiles.isEmpty
+            self.clearDuplicateReview()
+            self.setWindowVisible(self.isWindowVisible)
+            if changed { self.rescanDirectory(resetCache: true) }
+            else if self.currentURL != nil, !self.hasContent, !self.isLoading {
+                self.loadCurrent(quality: self.canvas.screenQuality, preservingImage: false)
+            }
+            self.view.window?.makeFirstResponder(self.selection?.showsGrid == true ? self.selectionGrid.collectionView : self.canvas)
+            self.updateTitle()
+        }
+    }
+
+    private func clearDuplicateReview() {
+        guard let review = duplicateReview else { return }
+        review.stop()
+        review.session.onChange = nil
+        review.session.onFilesRemoved = nil
+        review.view.removeFromSuperview()
+        review.removeFromParent()
+        duplicateReview = nil
+        duplicateRemovedFiles = []
+        (view as? MediaViewerRootView)?.accessibilityOverlay = nil
+    }
+
+    private func connectSelectionControls() {
+        selectionHeader.onFilter = { [weak self] in self?.selection?.setFilter($0) }
+        selectionHeader.onExport = { [weak self] in self?.showSelectionExportPanel() }
+        selectionHeader.onExit = { [weak self] in self?.endSelection() }
+        selectionHeader.onBack = { [weak self] in self?.selection?.showGrid() }
+        selectionHeader.onRetry = { [weak self] in self?.selection?.retrySave() }
+        selectionActions.onMark = { [weak self] in self?.markSelection($0) }
+        selectionActions.onAutoAdvance = { [weak self] in self?.selection?.setAutoAdvance($0) }
+        selectionActions.onUndo = { [weak self] in self?.undo(nil) }
+        selectionEmpty.onReview = { [weak self] in self?.selection?.setFilter(.picked) }
+        selectionEmpty.onExport = { [weak self] in self?.showSelectionExportPanel() }
+        selectionGrid.onOpen = { [weak self] url in self?.selectImage(url) }
+        selectionGrid.onRemove = { [weak self] url in
+            guard let self, self.canChangeLibraryOptions else { return }
+            self.selection?.mark(.pending, url: url)
+        }
+        canvas.onSelectionKey = { [weak self] in self?.handleSelectionKey($0) ?? false }
+        thumbnailStrip.collectionView.onSelectionKey = { [weak self] in self?.handleSelectionKey($0) ?? false }
+    }
+
+    func startSelection() {
+        guard canStartSelection, let directory else { return }
+        isSelectionStarting = true
+        let openingSession = session
+        updateTitle()
+        selectionTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.isSelectionStarting = false; self.selectionTask = nil; self.updateTitle() }
+            do {
+                let record = try await self.selectionStore.load(root: directory)
+                try Task.checkCancellation()
+                guard self.session == openingSession, self.directory == directory else { return }
+                let selection = SelectionSession(root: directory, record: record, store: self.selectionStore)
+                self.selectionPreviousScope = self.libraryOptions.includesSubdirectories
+                self.selection = selection
+                selection.onChange = { [weak self, weak selection] in
+                    guard let self, let selection, self.selection === selection else { return }
+                    self.applySelectionProjection()
+                }
+                self.thumbnailStrip.selectionStatus = { [weak selection] in selection?.status(of: $0) }
+                self.hideSearch()
+                if self.showsInfo { self.toggleInfo() }
+                let complete = self.libraryOptions.includesSubdirectories
+                selection.updatePhotos(self.libraryImages, complete: complete)
+                if !complete {
+                    self.libraryOptions.includesSubdirectories = true
+                    self.rescanDirectory(resetCache: false)
+                }
+                self.view.window?.makeFirstResponder(selection.showsGrid ? self.selectionGrid.collectionView : self.canvas)
+            } catch is CancellationError { return }
+            catch { self.canvas.showNotice("无法读取选片进度：\(error.localizedDescription)") }
+        }
+    }
+
+    func endSelection() {
+        guard duplicateReview == nil, !isDuplicateStarting, selection != nil, !isSelectionTransition else { return }
+        Task { [weak self] in
+            guard let self, await self.prepareForLibraryDeparture(), let directory = self.directory else { return }
+            let scope = self.selectionPreviousScope ?? true
+            let selected = self.selection?.currentURL
+            self.clearSelectionMode()
+            self.apply(LibrarySnapshot(directory: directory, images: self.libraryImages,
+                preferredImage: selected, isComplete: !self.isScanning, skippedPaths: 0))
+            // 网格保留焦点 URL，但已经停止大图解码；退出后即使 URL 没变也必须恢复预览。
+            if self.currentURL != nil, !self.hasContent, !self.isLoading {
+                self.loadCurrent(quality: self.canvas.screenQuality, preservingImage: false)
+            }
+            if self.libraryOptions.includesSubdirectories != scope { self.setIncludesSubdirectories(scope) }
+            self.view.window?.makeFirstResponder(self.canvas)
+        }
+    }
+
+    /// 应用退出、关窗以及打开另一个目录使用同一屏障；保存失败时保留可重试的原会话。
+    func prepareForLibraryDeparture() async -> Bool {
+        guard !isSelectionTransition else { return false }
+        isSelectionTransition = true
+        updateTitle()
+        defer { isSelectionTransition = false; updateTitle() }
+        duplicateTask?.cancel()
+        await duplicateTask?.value
+        if let review = duplicateReview, !(await review.session.prepareForDeparture()) { return false }
+        selectionTask?.cancel()
+        await selectionTask?.value
+        exportTask?.cancel()
+        await exportTask?.value
+        if let panel = exportPanel, let window = panel.window {
+            window.sheetParent?.endSheet(window)
+            panel.close()
+            exportPanel = nil
+        }
+        do { try await selection?.flush(); return true }
+        catch { canvas.showNotice("选片进度尚未保存，请点击“重试”后再离开。\(error.localizedDescription)"); return false }
+    }
+
+    private func clearSelectionMode() {
+        selection?.onChange = nil
+        selection = nil
+        selectionPreviousScope = nil
+        thumbnailStrip.selectionStatus = nil
+        selectionGrid.setActive(false)
+        selectionGrid.update(urls: [], missing: [])
+        selectionGrid.view.isHidden = true
+        selectionEmpty.isHidden = true
+        canvas.isHidden = false
+        updateSelectionControls()
+    }
+
+    private func applySelectionProjection() {
+        guard let selection else { return }
+        let previous = currentURL
+        let wasGrid = !selectionGrid.view.isHidden
+        let wasHidden = canvas.isHidden
+        let visible = selection.visibleURLs
+        let listChanged = images != visible
+        images = visible
+        currentIndex = selection.currentURL.flatMap { visible.firstIndex(of: $0) }
+        thumbnailStrip.update(images: images, selectedURL: currentURL, rootDirectory: directory)
+        thumbnailStrip.refreshSelectionStatuses()
+        // 保存状态的回调也会刷新界面，但不能打断用户正在进行的缩放和拖动。
+        if listChanged || previous != currentURL || wasGrid != selection.showsGrid { canvas.cancelInteraction() }
+        selectionGrid.view.isHidden = !selection.showsGrid
+        selectionGrid.update(urls: selection.pickedURLs, missing: selection.missingURLs)
+        selectionGrid.setActive(duplicateReview == nil && !isDuplicateStarting && selection.showsGrid && isWindowVisible && !isOpening)
+        canvas.isHidden = selection.showsGrid || images.isEmpty
+        selectionEmpty.isHidden = !images.isEmpty
+        if selection.showsGrid || currentURL == nil {
+            if isLoading || hasContent {
+                decodeTask?.cancel()
+                cancelLoadingIndicator()
+                playback.stop()
+                videoPlayback.stop()
+                loadID = UUID()
+                isLoading = false
+                displayedImage = nil
+                requestedQuality = nil
+            }
+            if selection.showsGrid && !wasGrid {
+                hideSearch()
+                if showsInfo { toggleInfo() }
+                view.window?.makeFirstResponder(selectionGrid.collectionView)
+            }
+        } else if currentURL != previous || wasGrid || wasHidden {
+            loadCurrent(quality: canvas.screenQuality, preservingImage: false)
+            refreshInfo()
+            if wasGrid { view.window?.makeFirstResponder(canvas) }
+        }
+        if listChanged { scheduleSearch() } else { updateSearchStatus() }
+        updateThumbnailVisibility()
+        updateTitle()
+    }
+
+    private func updateSelectionControls() {
+        selectionHeader.isHidden = selection == nil
+        selectionActions.isHidden = selection == nil
+        headerHeight?.constant = selection == nil ? 0 : selectionHeader.preferredHeight
+        actionsHeight?.constant = selection == nil ? 0 : 72
+        guard let selection else { return }
+        let enabled = !isSelectionTransition && !isSelectionStarting && !isOpening && !isTrashing
+        selectionHeader.update(selection, scanning: isScanning, enabled: enabled, exporting: isExportingSelection)
+        selectionActions.update(selection, canMark: canMarkSelection, hasImage: hasImage, enabled: enabled)
+        selectionEmpty.update(selection, scanning: isScanning)
+    }
+
+    func markSelection(_ status: PhotoSelectionStatus) {
+        guard canMarkSelection, status != .picked || hasImage else { return }
+        canvas.cancelInteraction()
+        view.window?.makeFirstResponder(canvas)
+        selection?.mark(status)
+    }
+
+    func handleSelectionKey(_ event: NSEvent) -> Bool {
+        guard selection != nil, !isEditingText, selection?.showsGrid == false,
+              view.window?.attachedSheet == nil,
+              event.modifierFlags.intersection([.command, .control, .option]).isEmpty else { return false }
+        let status: PhotoSelectionStatus
+        switch event.charactersIgnoringModifiers?.lowercased() {
+        case "p": status = .picked
+        case "x": status = .skipped
+        case "u": status = .pending
+        default: return false
+        }
+        // 长按产生的重复 keyDown 不能在缓存快速命中时连续标记一串尚未看过的照片。
+        if !event.isARepeat { markSelection(status) }
+        return true
+    }
+
+    @objc func undo(_ sender: Any?) {
+        guard duplicateReview == nil, !isDuplicateStarting, !isSelectionTransition else { return }
+        selection?.undoManager.undo()
+    }
+
+    @objc func redo(_ sender: Any?) {
+        guard duplicateReview == nil, !isDuplicateStarting, !isSelectionTransition else { return }
+        selection?.undoManager.redo()
+    }
+
+    func showSelectionExportPanel() {
+        guard canExportSelection, let window = view.window, window.attachedSheet == nil else { return }
+        let panel = NSOpenPanel()
+        panel.title = "选择原图导出位置"
+        panel.message = "将在所选位置新建入选照片文件夹，复制原图并保留原文件名。"
+        panel.prompt = "导出原图"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        let selection = selection
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let destination = panel.url, let self, self.selection === selection else { return }
+            self.exportSelection(to: destination)
+        }
+    }
+
+    func exportSelection(to destination: URL) {
+        guard canExportSelection, let selection else { return }
+        let urls = selection.pickedURLs
+        let rootName = selection.root.lastPathComponent
+        let panel = SelectionExportPanel(total: urls.count)
+        exportPanel = panel
+        isExportingSelection = true
+        lastSelectionExport = nil
+        panel.onCancel = { [weak self] in self?.exportTask?.cancel() }
+        if let window = view.window, let sheet = panel.window { window.beginSheet(sheet) }
+        updateTitle()
+        exportTask = Task { [weak self, panel] in
+            let worker = Task.detached(priority: .utility) {
+                try await SelectionExporter.export(urls, rootName: rootName, destination: destination, progress: { done, total in
+                    await panel.update(completed: done, total: total)
+                })
+            }
+            do {
+                let result = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+                self?.lastSelectionExport = result
+                panel.complete(result)
+            } catch { panel.fail(error) }
+            self?.isExportingSelection = false
+            self?.exportTask = nil
+            self?.updateTitle()
+        }
     }
 }

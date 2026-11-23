@@ -5,7 +5,7 @@ extension FixtureTestCase {
     @discardableResult
     func writeVideo(_ name: String = "video.mp4", width: Int = 160, height: Int = 90,
                     frames: Int = 24, rotated: Bool = false, blue: Bool = false,
-                    includesVideo: Bool = true, includesAudio: Bool = false) async throws -> URL
+                    includesVideo: Bool = true, includesAudio: Bool = false, changesToBlueAfter: Int? = nil) async throws -> URL
     {
         let url = fixtureDirectory.appendingPathComponent(name)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -43,7 +43,8 @@ extension FixtureTestCase {
                 let context = try #require(CGContext(data: CVPixelBufferGetBaseAddress(buffer), width: width, height: height,
                     bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
                     space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue))
-                context.setFillColor(CGColor(red: blue ? 0.1 : 0.9, green: 0.25, blue: blue ? 0.9 : 0.1, alpha: 1))
+                let frameIsBlue = blue || changesToBlueAfter.map { frame >= $0 } == true
+                context.setFillColor(CGColor(red: frameIsBlue ? 0.1 : 0.9, green: 0.25, blue: frameIsBlue ? 0.9 : 0.1, alpha: 1))
                 context.fill(CGRect(x: 0, y: 0, width: width, height: height))
                 context.setFillColor(CGColor(gray: 0.95, alpha: 1))
                 context.fill(CGRect(x: frame * 5 % max(1, width - 16), y: height / 3, width: 16, height: 16))

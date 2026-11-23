@@ -11,6 +11,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var directionMenu: NSMenu?
     private var sortingMenu: NSMenu?
     private weak var activeContextMenu: NSMenu?
+    private var allowsWindowClose = false
+    private var isPreparingClose = false
 
     func applicationWillFinishLaunching(_ notification: Notification) { installMenus() }
 
@@ -42,6 +44,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     func applicationWillTerminate(_ notification: Notification) { viewer?.closeLibrary() }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let viewer, viewer.needsLibraryDeparture else { return .terminateNow }
+        guard !viewer.isSelectionTransition else { return .terminateCancel }
+        Task { sender.reply(toApplicationShouldTerminate: await viewer.prepareForLibraryDeparture()) }
+        return .terminateLater
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard !allowsWindowClose, let viewer, viewer.needsLibraryDeparture else { return true }
+        guard !isPreparingClose else { return false }
+        isPreparingClose = true
+        Task { [weak self, weak sender] in
+            let ready = await viewer.prepareForLibraryDeparture()
+            guard let self else { return }
+            self.isPreparingClose = false
+            if ready {
+                self.allowsWindowClose = true
+                sender?.performClose(nil)
+                self.allowsWindowClose = false
+            }
+        }
+        return false
+    }
     func windowWillClose(_ notification: Notification) { viewer?.closeLibrary() }
     func windowDidResignKey(_ notification: Notification) { viewer?.canvas.cancelInteraction() }
     func windowDidChangeOcclusionState(_ notification: Notification) { viewer?.updateWindowVisibility() }
@@ -78,7 +103,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             viewer = controller
         }
         window?.makeKeyAndOrderFront(nil)
-        window?.makeFirstResponder(viewer?.canvas)
+        if let review = viewer?.duplicateReview { window?.makeFirstResponder(review.groupTable) }
+        else { window?.makeFirstResponder(viewer?.canvas) }
         viewer?.updateWindowVisibility()
     }
 
@@ -125,6 +151,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         file.addItem(.separator())
         addAction("重新载入文件", action: #selector(reloadImage), key: "r", to: file)
         addAction("刷新文件夹", action: #selector(refreshDirectory), key: "r", modifiers: [.command, .shift], to: file)
+        file.addItem(.separator())
+        addAction("检查重复照片与视频…", action: #selector(checkDuplicates), key: "", to: file)
         file.addItem(.separator())
         addAction("删除（移到废纸篓）", action: #selector(trashImage), key: "\u{8}", to: file)
         file.addItem(.separator())
@@ -182,6 +210,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         addAction("显示缩略条", action: #selector(toggleThumbnails), key: "", to: view)
         addSubmenu(view, to: main)
 
+        let selection = NSMenu(title: "选片")
+        addAction("开始选片", action: #selector(toggleSelection), key: "p", modifiers: [.command, .shift], to: selection)
+        selection.addItem(.separator())
+        addAction("入选", action: #selector(pickPhoto), key: "p", modifiers: [], to: selection)
+        addAction("跳过（保留原文件）", action: #selector(skipPhoto), key: "x", modifiers: [], to: selection)
+        addAction("恢复待选", action: #selector(resetPhotoSelection), key: "u", modifiers: [], to: selection)
+        selection.addItem(.separator())
+        addAction("查看入选", action: #selector(reviewPickedPhotos), key: "", to: selection)
+        addAction("导出入选原图…", action: #selector(exportPickedPhotos), key: "e", modifiers: [.command, .shift], to: selection)
+        addSubmenu(selection, to: main)
+
         let windowMenu = NSMenu(title: "窗口")
         windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         windowMenu.addItem(withTitle: "缩放", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
@@ -224,6 +263,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             }
         }
         if viewer.currentURL != nil {
+            if viewer.selection != nil {
+                append([#selector(pickPhoto), #selector(skipPhoto), #selector(resetPhotoSelection)], to: menu)
+                menu.addItem(.separator())
+            }
             append([#selector(NSText.copy(_:)), #selector(trashImage)], to: menu)
             menu.addItem(.separator())
             append([#selector(fitImage), #selector(actualSize)], to: menu)
@@ -254,7 +297,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         // 打开面板需要自己的方向键和文本编辑快捷键，不能被后台图片窗口截获。
         if window?.attachedSheet != nil { return false }
+        if menuItem.action == #selector(checkDuplicates) {
+            menuItem.title = viewer?.duplicateReview == nil ? "检查重复照片与视频…" : "退出重复检查"
+            return viewer?.canCheckDuplicates == true || (viewer?.duplicateReview != nil && viewer?.isSelectionTransition == false)
+        }
+        // 复核期间方向键交给版本列表，旧图库的删除、标记和缩放命令不能穿透工作区。
+        if viewer?.duplicateReview != nil || viewer?.isDuplicateStarting == true {
+            return (menuItem.action == #selector(openFile) || menuItem.action == #selector(openFolder))
+                && viewer?.isSelectionTransition == false
+        }
         switch menuItem.action {
+        case #selector(toggleSelection):
+            menuItem.title = viewer?.selection == nil ? "开始选片" : "退出选片"
+            return viewer?.canStartSelection == true || (viewer?.selection != nil && viewer?.isSelectionTransition == false)
+        case #selector(pickPhoto), #selector(skipPhoto), #selector(resetPhotoSelection):
+            let status: PhotoSelectionStatus = menuItem.action == #selector(pickPhoto) ? .picked
+                : (menuItem.action == #selector(skipPhoto) ? .skipped : .pending)
+            let current = viewer?.currentURL.flatMap { viewer?.selection?.status(of: $0) }
+            menuItem.state = current == status ? .on : .off
+            return viewer?.canMarkSelection == true && viewer?.isEditingText == false
+                && current != status && (status != .picked || viewer?.hasImage == true)
+        case #selector(reviewPickedPhotos): return viewer?.selection != nil && viewer?.canChangeLibraryOptions == true
+        case #selector(exportPickedPhotos): return viewer?.canExportSelection == true
         case #selector(toggleThumbnails):
             menuItem.state = viewer?.showsThumbnails == true ? .on : .off
             return viewer != nil
@@ -263,13 +327,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         case #selector(findImage): return viewer?.images.isEmpty == false
         case #selector(toggleInfo):
             menuItem.state = viewer?.showsInfo == true ? .on : .off
-            return viewer?.currentURL != nil || viewer?.showsInfo == true
+            return (viewer?.currentURL != nil && viewer?.selection?.showsGrid != true) || viewer?.showsInfo == true
         case #selector(reloadImage): return viewer?.canReloadImage == true
         case #selector(trashImage): return viewer?.canTrashImage == true && viewer?.isEditingText != true
         case #selector(refreshDirectory): return viewer?.canRefreshDirectory == true
         case #selector(toggleSubdirectories):
             menuItem.state = viewer?.libraryOptions.includesSubdirectories == true ? .on : .off
-            return viewer?.canChangeLibraryOptions == true
+            return viewer?.canChangeLibraryOptions == true && viewer?.selection == nil
         case #selector(changeSort(_:)):
             menuItem.state = viewer?.libraryOptions.sort.rawValue == menuItem.tag ? .on : .off
             return viewer?.canChangeLibraryOptions == true
@@ -283,6 +347,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     @objc private func openFile() { showOpenPanel(directoriesOnly: false) }
+    @objc private func checkDuplicates() {
+        if viewer?.duplicateReview != nil { viewer?.endDuplicateCheck() } else { viewer?.startDuplicateCheck() }
+    }
+    @objc private func toggleSelection() {
+        if viewer?.selection != nil { viewer?.endSelection() } else { viewer?.startSelection() }
+    }
+    @objc private func pickPhoto() { markPhoto(.picked) }
+    @objc private func skipPhoto() { markPhoto(.skipped) }
+    @objc private func resetPhotoSelection() { markPhoto(.pending) }
+    private func markPhoto(_ status: PhotoSelectionStatus) {
+        if let event = NSApp.currentEvent, event.type == .keyDown, event.isARepeat { return }
+        viewer?.markSelection(status)
+    }
+    @objc private func reviewPickedPhotos() { viewer?.selection?.setFilter(.picked) }
+    @objc private func exportPickedPhotos() { viewer?.showSelectionExportPanel() }
     @objc private func openFolder() { showOpenPanel(directoriesOnly: true) }
     @objc private func previousImage() { viewer?.navigate(by: -1) }
     @objc private func nextImage() { viewer?.navigate(by: 1) }

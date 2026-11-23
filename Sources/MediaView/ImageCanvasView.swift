@@ -13,6 +13,7 @@ final class ImageCanvasView: NSView {
     var onContextMenu: (() -> NSMenu?)?
     var onDismissOverlay: (() -> Bool)?
     var onToggleVideoPlayback: (() -> Void)?
+    var onSelectionKey: ((NSEvent) -> Bool)?
 
     private(set) var geometry = CanvasGeometry()
     private(set) var videoView: MediaPlayerView?
@@ -322,6 +323,7 @@ final class ImageCanvasView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if onSelectionKey?(event) == true { return }
         switch event.keyCode {
         case 123: onNavigate?(-1)
         case 124: onNavigate?(1)
