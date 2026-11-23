@@ -190,8 +190,12 @@ struct DuplicateFrame: Codable, Equatable, Sendable {
     let hash: UInt64
     let luminance: Data
     let colors: Data
-    private static let cosines = (0..<8).map { frequency in
-        (0..<32).map { cos(Double(2 * $0 + 1) * Double(frequency) * .pi / 64) }
+    // 显式固定中间量和返回类型，避免较旧 Swift 编译器在嵌套闭包内穷举数值运算的重载。
+    private static let cosines: [[Double]] = (0..<8).map { frequency -> [Double] in
+        (0..<32).map { position -> Double in
+            let phase = Double(2 * position + 1) * Double(frequency)
+            return cos(phase * Double.pi / 64.0)
+        }
     }
 
     init(_ image: CGImage) throws {
@@ -207,7 +211,10 @@ struct DuplicateFrame: Codable, Equatable, Sendable {
         guard rendered else { throw ImageDecodeError.invalidImage }
         let gray = (0..<1024).map { index -> UInt8 in
             let i = index * 4
-            return UInt8((Double(pixels[i]) * 0.299 + Double(pixels[i + 1]) * 0.587 + Double(pixels[i + 2]) * 0.114).rounded())
+            let red = Double(pixels[i]) * 0.299
+            let green = Double(pixels[i + 1]) * 0.587
+            let blue = Double(pixels[i + 2]) * 0.114
+            return UInt8((red + green + blue).rounded())
         }
         luminance = Data(gray)
         var rgb: [UInt8] = []

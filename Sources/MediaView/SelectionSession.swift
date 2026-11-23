@@ -285,16 +285,20 @@ final class SelectionSession {
     private func register(_ edit: Edit, undo: Bool) {
         undoManager.beginUndoGrouping()
         undoManager.registerUndo(withTarget: self) { target in
-            let position = undo ? edit.from : edit.to
-            target.record.filter = position.filter
-            target.record.showsGrid = position.grid
-            // 先恢复筛选再重建投影，跨筛选撤销时列表、计数和焦点必须属于同一状态。
-            target.setStatus(undo ? edit.before : edit.after, for: edit.url)
-            let visible = target.visibleURLs
-            target.currentURL = position.url.flatMap { visible.contains($0) ? $0 : nil } ?? visible.first
-            target.register(edit, undo: !undo)
-            target.rememberLocation()
-            target.changed()
+            // 旧版 SDK 将回调标为 @Sendable；本会话的 UndoManager 始终在主 actor 上使用。
+            // 保持同步执行，否则异步 Task 会在撤销分组关闭后才注册重做、恢复焦点。
+            MainActor.assumeIsolated {
+                let position = undo ? edit.from : edit.to
+                target.record.filter = position.filter
+                target.record.showsGrid = position.grid
+                // 先恢复筛选再重建投影，跨筛选撤销时列表、计数和焦点必须属于同一状态。
+                target.setStatus(undo ? edit.before : edit.after, for: edit.url)
+                let visible = target.visibleURLs
+                target.currentURL = position.url.flatMap { visible.contains($0) ? $0 : nil } ?? visible.first
+                target.register(edit, undo: !undo)
+                target.rememberLocation()
+                target.changed()
+            }
         }
         undoManager.setActionName("标记\(edit.after.title)")
         undoManager.endUndoGrouping()
