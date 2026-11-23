@@ -3,13 +3,14 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>ImageView</string>
+    <string>MediaView</string>
     <key>CFBundleDisplayName</key>
-    <string>ImageView</string>
+    <string>MediaView</string>
+    <!-- 保留旧版标识，应用更名不改变已有的文件关联和偏好设置域。 -->
     <key>CFBundleIdentifier</key>
     <string>com.imzbf.ImageView</string>
     <key>CFBundleExecutable</key>
-    <string>ImageView</string>
+    <string>MediaView</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -66,6 +67,24 @@
                 <string>rw2</string><string>rwl</string><string>pef</string>
                 <string>srw</string><string>3fr</string><string>fff</string>
                 <string>iiq</string><string>raw</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>视频</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.mpeg-4</string>
+                <string>com.apple.quicktime-movie</string>
+                <string>com.apple.m4v-video</string>
+            </array>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>mp4</string><string>mov</string><string>m4v</string>
             </array>
         </dict>
     </array>

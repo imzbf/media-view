@@ -1,0 +1,86 @@
+name: Release macOS installers
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: github.event.created && !github.event.deleted && !github.event.forced
+    runs-on: macos-15
+    outputs:
+      version: ${{ steps.tag.outputs.result }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate stable tag
+        id: tag
+        uses: actions/github-script@v8
+        with:
+          result-encoding: string
+          script: return require('./.github/scripts/release.cjs').stableVersion(context)
+      - name: Test tagged commit
+        if: steps.tag.outputs.result != ''
+        run: |
+          node --test .github/scripts/release.test.cjs
+          ./Scripts/test.sh
+
+  build:
+    needs: test
+    if: needs.test.outputs.version != ''
+    runs-on: macos-15
+    strategy:
+      matrix:
+        arch: [arm64, x86_64]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Build and verify DMG
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.test.outputs.version }}
+        run: ./Scripts/build-dmg.sh --arch "$ARCH" --version "$VERSION" --build-number "$GITHUB_RUN_NUMBER"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dmg-${{ matrix.arch }}
+          path: build/release/MediaView-${{ needs.test.outputs.version }}-${{ matrix.arch }}.dmg
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dmg-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/release-dmgs
+          digest-mismatch: error
+      - name: Verify assets on draft and publish
+        uses: actions/github-script@v8
+        env:
+          DMG_DIR: ${{ runner.temp }}/release-dmgs
+        with:
+          script: |
+            const { publishRelease } = require('./.github/scripts/release.cjs')
+            const commit = (await exec.getExecOutput('git', ['rev-parse', 'HEAD'])).stdout.trim()
+            core.info(await publishRelease({ github, context, commit, directory: process.env.DMG_DIR }))

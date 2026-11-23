@@ -2,14 +2,14 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_PATH="$PROJECT_ROOT/build/ImageView.app"
+APP_PATH="$PROJECT_ROOT/build/MediaView.app"
 SIGN_IDENTITY="-"
 NOTARY_PROFILE=""
 
 usage() {
     cat <<'USAGE'
 Usage: Scripts/sign-and-notarize.sh [options]
-  --app PATH             Existing ImageView.app
+  --app PATH             Existing .app (default: build/MediaView.app)
   --identity IDENTITY    Developer ID Application identity (default: ad-hoc)
   --notary-profile NAME  notarytool Keychain profile; enables submit and staple
 Credentials are read from Keychain, never from source files or command-line passwords.
@@ -27,7 +27,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$APP_PATH" == /* ]] || APP_PATH="$PWD/$APP_PATH"
-[[ -f "$APP_PATH/Contents/MacOS/ImageView" ]] || { echo "Missing app executable: $APP_PATH" >&2; exit 1; }
+[[ -f "$APP_PATH/Contents/MacOS/MediaView" ]] || { echo "Missing app executable: $APP_PATH" >&2; exit 1; }
 if [[ -n "$NOTARY_PROFILE" && "$SIGN_IDENTITY" == "-" ]]; then
     echo "Notarization requires a Developer ID Application certificate." >&2
     exit 2
@@ -45,8 +45,8 @@ if [[ -n "$NOTARY_PROFILE" ]]; then
     mkdir -p "$PROJECT_ROOT/.build"
     NOTARY_STAGE="$(mktemp -d "$PROJECT_ROOT/.build/notarization.XXXXXX")"
     trap 'rm -rf "$NOTARY_STAGE"' EXIT
-    ditto -c -k --keepParent "$APP_PATH" "$NOTARY_STAGE/ImageView.zip"
-    if ! xcrun notarytool submit "$NOTARY_STAGE/ImageView.zip" \
+    ditto -c -k --keepParent "$APP_PATH" "$NOTARY_STAGE/submission.zip"
+    if ! xcrun notarytool submit "$NOTARY_STAGE/submission.zip" \
         --keychain-profile "$NOTARY_PROFILE" --wait --output-format json > "$NOTARY_STAGE/result.json"; then
         cat "$NOTARY_STAGE/result.json" >&2
         exit 1

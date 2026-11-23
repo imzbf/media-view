@@ -2,14 +2,14 @@
 import PackageDescription
 
 let package = Package(
-    name: "ImageView",
+    name: "media-view",
     platforms: [.macOS(.v13)],
-    products: [.executable(name: "ImageView", targets: ["ImageView"])],
+    products: [.executable(name: "MediaView", targets: ["MediaView"])],
     targets: [
-        .executableTarget(name: "ImageView"),
+        .executableTarget(name: "MediaView"),
         .testTarget(
-            name: "ImageViewTests",
-            dependencies: ["ImageView"],
+            name: "MediaViewTests",
+            dependencies: ["MediaView"],
             resources: [.copy("Fixtures")]
         ),
     ],
