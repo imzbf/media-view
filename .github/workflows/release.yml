@@ -3,36 +3,56 @@ name: Release macOS installers
 on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已有的稳定版本标签，例如 v1.0.0'
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   test:
-    if: github.event.created && !github.event.deleted && !github.event.forced
+    if: github.event_name == 'workflow_dispatch' || (github.event.created && !github.event.deleted && !github.event.forced)
     runs-on: macos-15
     outputs:
-      version: ${{ steps.tag.outputs.result }}
+      version: ${{ steps.target.outputs.version }}
+      commit: ${{ steps.target.outputs.commit }}
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Validate stable tag
-        id: tag
+      - name: Test release automation
+        run: node --test .github/scripts/release.test.cjs
+      - name: Resolve stable release tag
+        id: target
         uses: actions/github-script@v8
         with:
-          result-encoding: string
-          script: return require('./.github/scripts/release.cjs').stableVersion(context)
-      - name: Test tagged commit
-        if: steps.tag.outputs.result != ''
-        run: |
-          node --test .github/scripts/release.test.cjs
-          ./Scripts/test.sh
+          script: |
+            const { stableVersion, resolveReleaseTarget } = require('./.github/scripts/release.cjs')
+            if (context.eventName === 'push' && !stableVersion(context)) return
+            const commit = (await exec.getExecOutput('git', ['rev-parse', 'HEAD'])).stdout.trim()
+            const target = await resolveReleaseTarget({ github, context, commit })
+            core.setOutput('version', target.version)
+            core.setOutput('commit', target.commit)
+      # 工作流可从 main 补发旧标签，但应用测试和构建必须来自同一份标签快照。
+      - uses: actions/checkout@v6
+        if: steps.target.outputs.version != ''
+        with:
+          ref: ${{ steps.target.outputs.commit }}
+          path: release-source
+          persist-credentials: false
+      - name: Test tagged application
+        if: steps.target.outputs.version != ''
+        working-directory: release-source
+        run: ./Scripts/test.sh
 
   build:
     needs: test
@@ -44,7 +64,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.test.outputs.commit }}
           persist-credentials: false
       - name: Build and verify DMG
         env:
@@ -60,7 +80,7 @@ jobs:
           overwrite: true
 
   publish:
-    needs: build
+    needs: [test, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -79,8 +99,8 @@ jobs:
         uses: actions/github-script@v8
         env:
           DMG_DIR: ${{ runner.temp }}/release-dmgs
+          RELEASE_COMMIT: ${{ needs.test.outputs.commit }}
         with:
           script: |
             const { publishRelease } = require('./.github/scripts/release.cjs')
-            const commit = (await exec.getExecOutput('git', ['rev-parse', 'HEAD'])).stdout.trim()
-            core.info(await publishRelease({ github, context, commit, directory: process.env.DMG_DIR }))
+            core.info(await publishRelease({ github, context, commit: process.env.RELEASE_COMMIT, directory: process.env.DMG_DIR }))

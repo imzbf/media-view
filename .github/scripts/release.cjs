@@ -6,9 +6,28 @@ const installNote = '选择对应的 DMG（Apple Silicon：arm64，Intel：x86_6
 const checksumHeading = '### SHA-256';
 
 function stableVersion({ eventName, ref, payload }) {
-    if (eventName !== 'push' || payload.ref !== ref || payload.created !== true ||
-        payload.deleted !== false || payload.forced !== false) return '';
-    return /^refs\/tags\/v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))$/.exec(ref)?.[1] ?? '';
+    let tag;
+    if (eventName === 'workflow_dispatch') {
+        tag = payload.inputs?.tag;
+    } else {
+        if (eventName !== 'push' || payload.ref !== ref || payload.created !== true ||
+            payload.deleted !== false || payload.forced !== false || !ref.startsWith('refs/tags/')) return '';
+        tag = ref.slice('refs/tags/'.length);
+    }
+    return /^v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))$/.exec(tag ?? '')?.[1] ?? '';
+}
+
+async function resolveReleaseTarget({ github, context, commit }) {
+    const version = stableVersion(context);
+    if (!version) throw new Error('Expected a new stable tag push or a manual release with an existing vX.Y.Z tag.');
+    const tag = `v${version}`;
+    // 补发使用标签原有提交，不能把运行工作流所选分支的新代码悄悄打进旧版本。
+    // getCommit 会将附注标签解析到提交，后续所有 job 都使用这份固定 SHA。
+    const { data } = await github.rest.repos.getCommit({ ...context.repo, ref: `tags/${tag}` });
+    if (context.eventName === 'push' && data.sha !== commit) {
+        throw new Error(`${tag} no longer points to the triggering commit ${commit}.`);
+    }
+    return { version, tag, commit: data.sha };
 }
 
 function checksumLine({ name, digest }) {
@@ -21,7 +40,7 @@ function matches(asset, file) {
 
 async function publishRelease({ github, context, commit, directory }) {
     const version = stableVersion(context);
-    if (!version) throw new Error('Not a newly pushed stable version tag.');
+    if (!version) throw new Error('Expected a stable release tag from a new push or a manual release.');
     const tag = `v${version}`;
     const names = ['arm64', 'x86_64'].map(arch => `MediaView-${version}-${arch}.dmg`);
     const entries = await readdir(directory, { withFileTypes: true });
@@ -101,4 +120,4 @@ async function publishRelease({ github, context, commit, directory }) {
     return `Published ${tag}: ${names.join(', ')}`;
 }
 
-module.exports = { stableVersion, publishRelease };
+module.exports = { stableVersion, resolveReleaseTarget, publishRelease };

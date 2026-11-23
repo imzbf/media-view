@@ -61,6 +61,8 @@ git tag v1.2.3 main
 git push origin v1.2.3
 ```
 
-只有新的 `vX.Y.Z` 标签会触发发布。测试通过且 Apple Silicon 和 Intel 的 DMG 均通过校验后，两个安装包会随 GitHub Release 一起发布。
+自动发布只响应新建的 `vX.Y.Z` 标签。测试通过且 Apple Silicon 和 Intel 的 DMG 均通过校验后，两个安装包会随 GitHub Release 一起发布。
 
-安装包使用 ad-hoc 签名，未经 Apple 公证，首次打开可能出现 macOS 安全提示。发布中断可在 Actions 重跑；已公开的附件不会被覆盖。
+若标签已推送但 Actions 没有运行记录，可在 **Actions → Release macOS installers → Run workflow** 中选择 `main`，填写已有标签（例如 `v1.0.0`）进行补发。补发会解析并固定标签原有的提交，使用它测试和打包；所选工作流分支的新代码不会混入该版本。已有运行记录的失败任务也可以直接在 Actions 中重跑。
+
+安装包使用 ad-hoc 签名，未经 Apple 公证，首次打开可能出现 macOS 安全提示。补发和重跑都不会覆盖已公开的附件。

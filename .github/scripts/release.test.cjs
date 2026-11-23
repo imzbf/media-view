@@ -3,7 +3,7 @@ const { createHash } = require('node:crypto');
 const { mkdir, mkdtemp, rm, writeFile } = require('node:fs/promises');
 const { join } = require('node:path');
 const test = require('node:test');
-const { stableVersion, publishRelease } = require('./release.cjs');
+const { stableVersion, resolveReleaseTarget, publishRelease } = require('./release.cjs');
 
 const tag = 'v1.2.3';
 const commit = 'a'.repeat(40);
@@ -11,6 +11,11 @@ const [arm, intel] = ['arm64', 'x86_64'].map(arch => `MediaView-1.2.3-${arch}.dm
 function push(ref = `refs/tags/${tag}`, event = {}) {
     return { eventName: 'push', repo: { owner: 'example', repo: 'media-view' }, ref,
         payload: { ref, created: true, deleted: false, forced: false, ...event } };
+}
+
+function manual(tagName = tag) {
+    return { eventName: 'workflow_dispatch', repo: { owner: 'example', repo: 'media-view' },
+        ref: 'refs/heads/main', payload: { inputs: { tag: tagName } } };
 }
 
 test('only a new, stable tag push selects a version', () => {
@@ -29,7 +34,15 @@ test('only a new, stable tag push selects a version', () => {
     }
 });
 
-async function fixture(t) {
+test('manual releases require an explicit stable tag instead of the selected workflow branch', () => {
+    assert.equal(stableVersion(manual('v1.0.0')), '1.0.0');
+    assert.equal(stableVersion(manual('v12.34.100')), '12.34.100');
+    for (const name of ['', 'main', 'refs/tags/v1.0.0', 'v01.0.0', 'v1.0', 'v1.0.0-rc.1', 'v1.0.0+1']) {
+        assert.equal(stableVersion(manual(name)), '');
+    }
+});
+
+async function fixture(t, context = push()) {
     const root = join(__dirname, '../../.build');
     await mkdir(root, { recursive: true });
     const dir = await mkdtemp(join(root, 'release-test.'));
@@ -72,8 +85,24 @@ async function fixture(t) {
         },
     };
     const github = { rest: { repos: api }, paginate: (method, params) => method(params) };
-    return { dir, state, api, run: () => publishRelease({ github, context: push(), commit, directory: dir }) };
+    return { dir, state, api, github, run: () => publishRelease({ github, context, commit, directory: dir }) };
 }
+
+test('manual recovery pins the existing tag even when workflow code has a newer commit', async t => {
+    const { github } = await fixture(t);
+    const target = await resolveReleaseTarget({ github, context: manual(), commit: 'b'.repeat(40) });
+    assert.deepEqual(target, { version: '1.2.3', tag, commit });
+});
+
+test('release resolution rejects invalid or missing tags and moved push targets', async t => {
+    const { github, state, api } = await fixture(t);
+    await assert.rejects(resolveReleaseTarget({ github, context: manual('main'), commit }), /stable tag/);
+    state.sha = 'b'.repeat(40);
+    await assert.rejects(resolveReleaseTarget({ github, context: push(), commit }), /triggering commit/);
+    api.getCommit = () => { throw new Error('Tag not found'); };
+    await assert.rejects(resolveReleaseTarget({ github, context: manual(), commit }), /Tag not found/);
+    assert.deepEqual(state.writes, []);
+});
 
 test('publishes two verified DMGs with installation and signing notes', async t => {
     const { run, state } = await fixture(t);
@@ -83,6 +112,29 @@ test('publishes two verified DMGs with installation and signing notes', async t 
     assert.equal(state.release.prerelease, false);
     assert.match(state.release.body, /ad-hoc.*Apple 公证.*首次打开/);
     for (const { digest, name } of state.assets) assert.ok(state.release.body.includes(`${digest.slice(7)}  ${name}`));
+});
+
+test('manual recovery publishes the verified tag and keeps existing public releases unchanged', async t => {
+    const { run, state } = await fixture(t, manual());
+    await run();
+    assert.equal(state.release.tag_name, tag);
+    assert.equal(state.release.target_commitish, commit);
+    assert.equal(state.release.draft, false);
+    state.writes.length = 0;
+    await run();
+    assert.deepEqual(state.writes, []);
+});
+
+test('moving a tag during manual recovery prevents publication', async t => {
+    const { run, state, api } = await fixture(t, manual());
+    const getCommit = api.getCommit;
+    api.getCommit = params => {
+        if (state.assets.length) state.sha = 'b'.repeat(40);
+        return getCommit(params);
+    };
+    await assert.rejects(run(), /no longer points/);
+    assert.equal(state.release.draft, true);
+    assert.ok(!state.writes.includes('publish'));
 });
 
 test('missing, empty or extra local artifacts cannot create a release', async t => {
